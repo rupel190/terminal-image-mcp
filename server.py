@@ -23,16 +23,34 @@ mcp = FastMCP("term-image")
 WEZTERM = shutil.which("wezterm")
 WINDOW_CLASS = "wezterm-image"
 
-# The window's program. imgcat draws the image at whatever size the terminal is when
-# it runs — and a window manager resizes the window *after* it has mapped, so a single
-# draw is sized for the pty's 80x24 starting point and then sits in the corner of a
-# much larger window (or, if the resize lands mid-draw, is clipped). Redrawing on
-# SIGWINCH is what makes the image track the window it ends up in.
+# The window's program. imgcat draws the image at whatever size the terminal is when it
+# runs — and a window manager resizes the window *after* it has mapped, so a single draw
+# is sized for the pty's 80x24 starting point and then sits in the corner of a much
+# larger window. Redrawing is what makes the image track the window it ends up in.
+#
+# It watches the size rather than trapping SIGWINCH: a signal that arrives while imgcat
+# is still drawing the previous frame is not queued, and that lost frame is exactly the
+# last one — the window's final size. Comparing `stty size` cannot miss it.
 VIEWER = r"""
-draw() { printf '\033[2J\033[H'; wezterm imgcat --width 100% --height 100% "$1"; }
-trap 'draw "$1"' WINCH
-draw "$1"
-while :; do sleep 86400; done
+stty -echo 2>/dev/null   # it is a viewer, not a shell: stray keystrokes shouldn't show
+prev=''
+n=0
+while :; do
+    cur=$(stty size 2>/dev/null)
+    [ -n "$cur" ] || cur='24 80'
+    # `stty size` is in CELLS, and a window can change PIXEL size without changing its
+    # cell count — a frame the size check cannot see, and the one that clips the image.
+    # So redraw unconditionally while the geometry is still settling.
+    if [ "$cur" != "$prev" ] || [ "$n" -lt 10 ]; then
+        prev=$cur
+        n=$((n + 1))
+        printf '\033[2J\033[H'
+        # Size in cells, not `--width 100%`: a percentage is resolved against pixels, and
+        # on a fractionally scaled display that overshoots the window and clips the image.
+        wezterm imgcat --width "${cur#* }" --height "${cur% *}" "$1"
+    fi
+    sleep 0.4
+done
 """
 
 _proc: subprocess.Popen | None = None  # the current image window, if still open
