@@ -20,7 +20,8 @@ agent: → a terminal window opens with the picture
 
 That's all. `server.py` is a self-contained [PEP 723](https://peps.python.org/pep-0723/)
 script — `uv` reads its inline dependency (`fastmcp`) and runs it; nothing to install
-by hand. The server does not need to run inside a WezTerm pane.
+by hand. WezTerm is the only program it invokes — no shell involved — and it does not
+need to run inside a terminal itself.
 
 ## Install
 
@@ -58,18 +59,16 @@ show me ~/pics/cat.png
 **Tool:** `show_image(file_path, cols=None, rows=None)`. Formats: whatever
 `wezterm imgcat` supports (PNG, JPEG, GIF, WebP, BMP, …).
 
-`cols`/`rows` set the window size where the window manager allows it. Tiling
-compositors override them, so there size and placement are a WM concern — the window
-carries the class `wezterm-image` if you want to target it with a rule.
+`cols`/`rows` set the window size where the window manager allows it.
 
 ## How it works
 
 1. Closes the previous image window, if one is still open.
-2. Starts a WezTerm process — `wezterm start --always-new-process --class wezterm-image`
-   — running `wezterm imgcat <path>; exec bash`.
-3. `imgcat` runs inside that window's own shell, where there is a real TTY to query for
-   size. `exec bash` keeps the window alive afterwards, so a failure stays readable
-   instead of flashing past.
+2. Starts a WezTerm process of its own — `wezterm start --always-new-process` — whose
+   program is `wezterm imgcat <path>`. It runs under the window class `wezterm-image`.
+3. `imgcat` is the window's program, so it has the pty it needs to size the image, and
+   `exit_behavior="Hold"` keeps the window up once it returns — including when it fails,
+   so an error stays readable instead of flashing past.
 
 Nothing repaints that window, so the image stays clean and permanent — unlike drawing
 into the conversation itself.
