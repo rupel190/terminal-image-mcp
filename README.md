@@ -65,8 +65,18 @@ show me ~/pics/cat.png
 
 1. Closes the previous image window, if one is still open.
 2. Starts a WezTerm process of its own — `wezterm start --always-new-process` — under the
-   window class `wezterm-image`, running a small `sh` viewer. It passes `--skip-config`,
-   so a personal `wezterm.lua`'s startup hooks don't open stray tabs in it.
+   window class `wezterm-image`, running a small `sh` viewer. It uses your own
+   `wezterm.lua`, so the window looks like your terminal, and sets `WEZTERM_IMAGE_MCP=1`
+   in its environment. Test that variable in your config to skip anything that shouldn't
+   run in a throwaway viewer — a `mux-startup` handler that spawns a workspace layout,
+   for instance, would otherwise open a stray shell tab beside the image:
+
+   ```lua
+   wezterm.on('mux-startup', function()
+     if os.getenv('WEZTERM_IMAGE_MCP') then return end
+     -- your layout
+   end)
+   ```
 3. The viewer draws the image at the terminal's size **in cells** and redraws it when
    that changes, plus unconditionally for the first few seconds while the geometry
    settles. That is what keeps the image the size of the window: a window manager

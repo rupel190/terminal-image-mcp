@@ -89,9 +89,11 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
 
     _close_previous()
 
-    # `--skip-config` because a personal wezterm.lua can carry startup hooks and
-    # default startup arguments, which would run here too and open stray tabs in
-    # what should be a window showing one image.
+    # The window runs the user's own wezterm.lua, so it looks like their terminal. It
+    # carries WEZTERM_IMAGE_MCP=1 in its environment, which a config can test to skip
+    # anything that shouldn't happen in a throwaway viewer — a `mux-startup` handler
+    # that spawns a workspace layout will otherwise open a stray shell tab beside the
+    # image, since this window has a mux of its own.
     #
     # stdio goes to DEVNULL: the window outlives this call, and an inherited pipe
     # would both keep the caller's output open and let the child write into an
@@ -101,7 +103,6 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
         _proc = subprocess.Popen(
             [
                 WEZTERM,
-                "--skip-config",
                 "--config", "hide_tab_bar_if_only_one_tab=true",
                 *(["--config", f"initial_cols={int(cols)}"] if cols else []),
                 *(["--config", f"initial_rows={int(rows)}"] if rows else []),
@@ -109,6 +110,7 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
                 "--class", WINDOW_CLASS,
                 "--", "sh", "-c", VIEWER, "sh", path,
             ],
+            env={**os.environ, "WEZTERM_IMAGE_MCP": "1"},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
