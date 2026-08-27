@@ -20,8 +20,8 @@ agent: → a terminal window opens with the picture
 
 That's all. `server.py` is a self-contained [PEP 723](https://peps.python.org/pep-0723/)
 script — `uv` reads its inline dependency (`fastmcp`) and runs it; nothing to install
-by hand. WezTerm is the only program it invokes — no shell involved — and it does not
-need to run inside a terminal itself.
+by hand. It invokes WezTerm and a POSIX `sh` for the window's redraw loop, and does
+not need to run inside a terminal itself.
 
 ## Install
 
@@ -64,11 +64,14 @@ show me ~/pics/cat.png
 ## How it works
 
 1. Closes the previous image window, if one is still open.
-2. Starts a WezTerm process of its own — `wezterm start --always-new-process` — whose
-   program is `wezterm imgcat <path>`. It runs under the window class `wezterm-image`.
-3. `imgcat` is the window's program, so it has the pty it needs to size the image, and
-   `exit_behavior="Hold"` keeps the window up once it returns — including when it fails,
-   so an error stays readable instead of flashing past.
+2. Starts a WezTerm process of its own — `wezterm start --always-new-process` — under the
+   window class `wezterm-image`, running a small `sh` viewer. It passes `--skip-config`,
+   so a personal `wezterm.lua`'s startup hooks don't open stray tabs in it.
+3. The viewer draws the image with `wezterm imgcat --width 100% --height 100%`, and
+   redraws it on `SIGWINCH`. That is what keeps the image the size of the window: a
+   window manager resizes the window *after* it maps, so a single draw would be sized
+   for the pty's 80×24 starting point — a small image in the corner of a large window,
+   or a clipped one if the resize lands mid-draw.
 
 Nothing repaints that window, so the image stays clean and permanent — unlike drawing
 into the conversation itself.

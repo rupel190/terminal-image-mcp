@@ -23,6 +23,18 @@ mcp = FastMCP("term-image")
 WEZTERM = shutil.which("wezterm")
 WINDOW_CLASS = "wezterm-image"
 
+# The window's program. imgcat draws the image at whatever size the terminal is when
+# it runs — and a window manager resizes the window *after* it has mapped, so a single
+# draw is sized for the pty's 80x24 starting point and then sits in the corner of a
+# much larger window (or, if the resize lands mid-draw, is clipped). Redrawing on
+# SIGWINCH is what makes the image track the window it ends up in.
+VIEWER = r"""
+draw() { printf '\033[2J\033[H'; wezterm imgcat --width 100% --height 100% "$1"; }
+trap 'draw "$1"' WINCH
+draw "$1"
+while :; do sleep 86400; done
+"""
+
 _proc: subprocess.Popen | None = None  # the current image window, if still open
 
 
@@ -59,11 +71,6 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
 
     _close_previous()
 
-    # imgcat IS the window's program — it gets the pty it needs to size the image,
-    # and no shell is involved. `exit_behavior="Hold"` keeps the window up once
-    # imgcat returns, including when it fails, so an error stays readable instead
-    # of flashing past.
-    #
     # `--skip-config` because a personal wezterm.lua can carry startup hooks and
     # default startup arguments, which would run here too and open stray tabs in
     # what should be a window showing one image.
@@ -77,13 +84,12 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
             [
                 WEZTERM,
                 "--skip-config",
-                "--config", 'exit_behavior="Hold"',
                 "--config", "hide_tab_bar_if_only_one_tab=true",
                 *(["--config", f"initial_cols={int(cols)}"] if cols else []),
                 *(["--config", f"initial_rows={int(rows)}"] if rows else []),
                 "start", "--always-new-process",
                 "--class", WINDOW_CLASS,
-                "--", WEZTERM, "imgcat", path,
+                "--", "sh", "-c", VIEWER, "sh", path,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
