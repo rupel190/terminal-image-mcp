@@ -33,21 +33,45 @@ WINDOW_CLASS = "wezterm-image"
 # last one — the window's final size. Comparing `stty size` cannot miss it.
 VIEWER = r"""
 stty -echo 2>/dev/null   # it is a viewer, not a shell: stray keystrokes shouldn't show
+printf '\033[?25l'      # hide the cursor; it blinks in the middle of the picture otherwise
 prev=''
 n=0
 while :; do
     cur=$(stty size 2>/dev/null)
-    [ -n "$cur" ] || cur='24 80'
+    rows=${cur% *}
+    cols=${cur#* }
+    # ⛔ A DEGENERATE SIZE IS THE REPORTED CRASH. Mid-resize `stty size` can answer `0 0` or
+    # nothing at all, and `wezterm imgcat --width 0` fails with
+    #   ERROR wezterm > no size information available: no size information available; terminating
+    # which kills the draw and leaves the window blank. Wait for a real size instead of
+    # substituting a fake 24x80, which drew a tiny image and then had to redraw anyway.
+    case "$rows$cols" in ''|*[!0-9]*) sleep 0.2; continue ;; esac
+    [ "$rows" -ge 4 ] && [ "$cols" -ge 8 ] || { sleep 0.2; continue; }
+    # ⛔⛔ ONE ROW SHORT, ALWAYS. `imgcat` fits the image inside the box it is given, but a box
+    # exactly `rows` tall ends on the last line and the terminal SCROLLS — and once it has
+    # scrolled, `\033[2J` clears only what is still on screen. Every redraw then leaves its own
+    # strip behind in the scrollback, which is the repeated-caption glitch on a tall image: not
+    # a tiling artefact, ten honest redraws stacked up.
+    h=$((rows - 1))
     # `stty size` is in CELLS, and a window can change PIXEL size without changing its
     # cell count — a frame the size check cannot see, and the one that clips the image.
-    # So redraw unconditionally while the geometry is still settling.
-    if [ "$cur" != "$prev" ] || [ "$n" -lt 10 ]; then
-        prev=$cur
+    # So redraw a few more times after the geometry stops moving.
+    # ⛔ The counter RESETS on every change. It used to count from process start, so the ten
+    # settling redraws were spent in the first four seconds — and a window manager that resizes
+    # later than that got no settling pass at all, leaving the image sized for a window that no
+    # longer exists. Counting from the LAST change is what makes it a settling loop rather than a
+    # stopwatch. Four is enough once it is anchored to the right moment; ten was compensating for
+    # being anchored to the wrong one, at the cost of re-decoding a multi-megabyte PNG nine times.
+    if [ "$cur" != "$prev" ]; then prev=$cur; n=0; fi
+    if [ "$n" -lt 4 ]; then
         n=$((n + 1))
-        printf '\033[2J\033[H'
+        # \033[3J clears the SCROLLBACK as well. Without it a strip that scrolled off before
+        # the fix above landed is still sitting above the viewport, one scroll-wheel away.
+        printf '\033[H\033[2J\033[3J'
         # Size in cells, not `--width 100%`: a percentage is resolved against pixels, and
         # on a fractionally scaled display that overshoots the window and clips the image.
-        wezterm imgcat --width "${cur#* }" --height "${cur% *}" "$1"
+        # stderr is dropped: imgcat's own diagnostics would be drawn INTO the picture.
+        wezterm imgcat --width "$cols" --height "$h" "$1" 2>/dev/null
     fi
     sleep 0.4
 done
