@@ -15,6 +15,7 @@ time — opening a new one closes the previous.
 import os
 import shutil
 import subprocess
+import tempfile
 
 from fastmcp import FastMCP
 
@@ -35,6 +36,7 @@ VIEWER = r"""
 stty -echo 2>/dev/null   # it is a viewer, not a shell: stray keystrokes shouldn't show
 printf '\033[?25l'      # hide the cursor; it blinks in the middle of the picture otherwise
 prev=''
+shown=''
 n=0
 while :; do
     cur=$(stty size 2>/dev/null)
@@ -62,6 +64,14 @@ while :; do
     # longer exists. Counting from the LAST change is what makes it a settling loop rather than a
     # stopwatch. Four is enough once it is anchored to the right moment; ten was compensating for
     # being anchored to the wrong one, at the cost of re-decoding a multi-megabyte PNG nine times.
+    # ⭐⭐ The image to show is READ EACH TICK from a state file, not baked in as "$1". Showing a
+    # second image used to close the window and open a new one, which makes a tiling window
+    # manager re-lay the whole workspace — *"reuse the MCP window when it's already there, so I
+    # can keep working in the 50:50 terminal split"*. A window that never closes cannot disturb a
+    # layout, so a new image is a redraw rather than a new window.
+    img=$(cat "$IMG_STATE" 2>/dev/null)
+    [ -n "$img" ] && [ -f "$img" ] || { sleep 0.2; continue; }
+    if [ "$img" != "$shown" ]; then shown=$img; n=0; fi
     if [ "$cur" != "$prev" ]; then prev=$cur; n=0; fi
     if [ "$n" -lt 4 ]; then
         n=$((n + 1))
@@ -71,7 +81,7 @@ while :; do
         # Size in cells, not `--width 100%`: a percentage is resolved against pixels, and
         # on a fractionally scaled display that overshoots the window and clips the image.
         # stderr is dropped: imgcat's own diagnostics would be drawn INTO the picture.
-        wezterm imgcat --width "$cols" --height "$h" "$1" 2>/dev/null
+        wezterm imgcat --width "$cols" --height "$h" "$img" 2>/dev/null
     fi
     sleep 0.4
 done
@@ -79,17 +89,22 @@ done
 
 _proc: subprocess.Popen | None = None  # the current image window, if still open
 
+#: Which image the open window should be showing. ⭐ The window watches this file, so a second
+#: `show_image` is a REDRAW in the window that is already there rather than a new window — which
+#: is what keeps a tiling layout intact. One path, overwritten; nothing accumulates.
+IMG_STATE = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "wezterm-image-mcp.current"
+)
 
-def _close_previous() -> None:
-    """Close the last image window so they do not accumulate."""
-    global _proc
-    if _proc is not None and _proc.poll() is None:
-        _proc.terminate()
-        try:
-            _proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            _proc.kill()
-    _proc = None
+
+def _window_is_open() -> bool:
+    """True when a viewer we started is still running.
+
+    ⚠️ Asks the PROCESS, not a remembered flag. The user closes this window by hand — that is the
+    normal way it ends — so a cached "it is open" would leave every later image written to a state
+    file nobody reads, and the tool would report success while showing nothing.
+    """
+    return _proc is not None and _proc.poll() is None
 
 
 @mcp.tool()
@@ -111,7 +126,20 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
     if not os.path.exists(path):
         return f"Error: file not found: {path}"
 
-    _close_previous()
+    # ⭐⭐ POINT THE EXISTING WINDOW AT THE NEW IMAGE. Writing the path is the whole handoff: the
+    # viewer re-reads this file every tick and redraws when it changes. Closing and reopening
+    # instead makes a tiling window manager re-lay the entire workspace, which is disruptive
+    # precisely when the window is most useful — beside the work, in a split.
+    # ⚠️ Written atomically. A reader that catches a half-written path would fail its `-f` test
+    # and, worse, could stick on the old image with no sign anything went wrong.
+    os.makedirs(os.path.dirname(IMG_STATE), exist_ok=True)
+    tmp = f"{IMG_STATE}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(path)
+    os.replace(tmp, IMG_STATE)
+
+    if _window_is_open():
+        return f"Showing {os.path.basename(path)} in the existing wezterm window"
 
     # The window runs the user's own wezterm.lua, so it looks like their terminal. It
     # carries WEZTERM_IMAGE_MCP=1 in its environment, which a config can test to skip
@@ -132,9 +160,9 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
                 *(["--config", f"initial_rows={int(rows)}"] if rows else []),
                 "start", "--always-new-process",
                 "--class", WINDOW_CLASS,
-                "--", "sh", "-c", VIEWER, "sh", path,
+                "--", "sh", "-c", VIEWER, "sh",
             ],
-            env={**os.environ, "WEZTERM_IMAGE_MCP": "1"},
+            env={**os.environ, "WEZTERM_IMAGE_MCP": "1", "IMG_STATE": IMG_STATE},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -143,7 +171,7 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
     except OSError as exc:
         return f"Error: could not start a wezterm window: {exc}"
 
-    return f"Showing {os.path.basename(path)} in its own wezterm window"
+    return f"Showing {os.path.basename(path)} in a new wezterm window"
 
 
 if __name__ == "__main__":
