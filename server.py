@@ -2,20 +2,24 @@
 # requires-python = ">=3.10"
 # dependencies = ["fastmcp"]
 # ///
-"""wezterm-image-mcp — show an image from an MCP client.
+"""wezterm-image-mcp — show images from an MCP client, as a scrollable chronicle.
 
 A repainting TUI can't keep an inline image alive: it redraws its own region and
 WezTerm stores images in the cell grid, so anything drawn inline gets shredded.
-So instead of fighting it, this opens the image in its own WezTerm window.
+So instead of fighting it, this opens a WezTerm window of its own and appends to it.
 
-The window is a standalone process, so closing it closes only it. One image at a
-time — opening a new one closes the previous.
+⭐⭐ The window is a CHRONICLE, not a slot. Every image is appended below the last with
+its own caption and path, and the terminal's scrollback IS the history — scroll up to
+find anything shown earlier in the session. It used to show one image at a time and
+close the previous one, which made a series unreadable: *"it's just some image I can't
+really tell what's it for, where it's from. And it overrides the previous pictures too."*
 """
 
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 
 from fastmcp import FastMCP
 
@@ -25,75 +29,95 @@ WEZTERM = shutil.which("wezterm")
 WINDOW_CLASS = "wezterm-image"
 
 # The window's program. imgcat draws the image at whatever size the terminal is when it
-# runs — and a window manager resizes the window *after* it has mapped, so a single draw
-# is sized for the pty's 80x24 starting point and then sits in the corner of a much
-# larger window. Redrawing is what makes the image track the window it ends up in.
+# runs — and a window manager resizes the window *after* it has mapped, so a draw issued
+# immediately is sized for the pty's 80x24 starting point and then sits in the corner of a
+# much larger window. Waiting for the size to SETTLE is what makes the image fit the window
+# it ends up in.
 #
-# It watches the size rather than trapping SIGWINCH: a signal that arrives while imgcat
-# is still drawing the previous frame is not queued, and that lost frame is exactly the
-# last one — the window's final size. Comparing `stty size` cannot miss it.
+# ⛔⛔ AN APPENDED IMAGE CANNOT BE RESIZED AFTERWARDS, and that is the deliberate trade.
+# The old viewer re-drew on every resize, which is why it had to clear the screen — and
+# clearing is exactly what destroys a history. Each image is now committed to the scrollback
+# at the size the window had when it arrived. Resizing later re-flows the text but leaves
+# earlier pictures as they were; that is the cost of being able to scroll back at all.
 VIEWER = r"""
 stty -echo 2>/dev/null   # it is a viewer, not a shell: stray keystrokes shouldn't show
 printf '\033[?25l'      # hide the cursor; it blinks in the middle of the picture otherwise
+drawn=0
+epoch=''
 prev=''
-shown=''
-n=0
+settle=0
 while :; do
     cur=$(stty size 2>/dev/null)
     rows=${cur% *}
     cols=${cur#* }
-    # ⛔ A DEGENERATE SIZE IS THE REPORTED CRASH. Mid-resize `stty size` can answer `0 0` or
+    # ⛔ A DEGENERATE SIZE IS A REPORTED CRASH. Mid-resize `stty size` can answer `0 0` or
     # nothing at all, and `wezterm imgcat --width 0` fails with
-    #   ERROR wezterm > no size information available: no size information available; terminating
+    #   ERROR wezterm > no size information available; terminating
     # which kills the draw and leaves the window blank. Wait for a real size instead of
     # substituting a fake 24x80, which drew a tiny image and then had to redraw anyway.
     case "$rows$cols" in ''|*[!0-9]*) sleep 0.2; continue ;; esac
     [ "$rows" -ge 4 ] && [ "$cols" -ge 8 ] || { sleep 0.2; continue; }
-    # ⛔⛔ ONE ROW SHORT, ALWAYS. `imgcat` fits the image inside the box it is given, but a box
-    # exactly `rows` tall ends on the last line and the terminal SCROLLS — and once it has
-    # scrolled, `\033[2J` clears only what is still on screen. Every redraw then leaves its own
-    # strip behind in the scrollback, which is the repeated-caption glitch on a tall image: not
-    # a tiling artefact, ten honest redraws stacked up.
-    h=$((rows - 1))
-    # `stty size` is in CELLS, and a window can change PIXEL size without changing its
-    # cell count — a frame the size check cannot see, and the one that clips the image.
-    # So redraw a few more times after the geometry stops moving.
-    # ⛔ The counter RESETS on every change. It used to count from process start, so the ten
-    # settling redraws were spent in the first four seconds — and a window manager that resizes
-    # later than that got no settling pass at all, leaving the image sized for a window that no
-    # longer exists. Counting from the LAST change is what makes it a settling loop rather than a
-    # stopwatch. Four is enough once it is anchored to the right moment; ten was compensating for
-    # being anchored to the wrong one, at the cost of re-decoding a multi-megabyte PNG nine times.
-    # ⭐⭐ The image to show is READ EACH TICK from a state file, not baked in as "$1". Showing a
-    # second image used to close the window and open a new one, which makes a tiling window
-    # manager re-lay the whole workspace — *"reuse the MCP window when it's already there, so I
-    # can keep working in the 50:50 terminal split"*. A window that never closes cannot disturb a
-    # layout, so a new image is a redraw rather than a new window.
-    img=$(cat "$IMG_STATE" 2>/dev/null)
-    [ -n "$img" ] && [ -f "$img" ] || { sleep 0.2; continue; }
-    if [ "$img" != "$shown" ]; then shown=$img; n=0; fi
-    if [ "$cur" != "$prev" ]; then prev=$cur; n=0; fi
-    if [ "$n" -lt 4 ]; then
-        n=$((n + 1))
-        # \033[3J clears the SCROLLBACK as well. Without it a strip that scrolled off before
-        # the fix above landed is still sitting above the viewport, one scroll-wheel away.
+
+    # ⛔ Draw only once the geometry has stopped moving. `stty size` is in CELLS and a window
+    # can change PIXEL size without changing its cell count, so the counter is a settling
+    # loop anchored to the LAST change, never a stopwatch from process start — a window
+    # manager that resizes late used to get no settling pass at all.
+    if [ "$cur" != "$prev" ]; then prev=$cur; settle=0; else settle=$((settle + 1)); fi
+    [ "$settle" -ge 3 ] || { sleep 0.2; continue; }
+
+    [ -f "$IMG_STATE" ] || { sleep 0.3; continue; }
+
+    # Line 1 is the epoch. A new epoch means the caller cleared the history, which is the
+    # ONLY thing that may wipe the scrollback — every other path only ever appends.
+    e=$(head -n 1 "$IMG_STATE" 2>/dev/null)
+    if [ "$e" != "$epoch" ]; then
+        epoch=$e
+        drawn=0
         printf '\033[H\033[2J\033[3J'
-        # Size in cells, not `--width 100%`: a percentage is resolved against pixels, and
-        # on a fractionally scaled display that overshoots the window and clips the image.
+    fi
+
+    total=$(wc -l < "$IMG_STATE" 2>/dev/null)
+    case "$total" in ''|*[!0-9]*) sleep 0.3; continue ;; esac
+    total=$((total - 1))
+
+    while [ "$drawn" -lt "$total" ]; do
+        drawn=$((drawn + 1))
+        line=$(sed -n "$((drawn + 1))p" "$IMG_STATE" 2>/dev/null)
+        [ -n "$line" ] || continue
+        img=${line%%	*}
+        title=${line#*	}
+        [ -f "$img" ] || continue
+        # ⭐⭐ The caption and the path are printed as TEXT, not burned into the picture, so
+        # they can be SELECTED AND COPIED out of the terminal — *"can you just write it so
+        # it's copy-pastable"*. They also survive scrolling, which a title inside the image
+        # only does at the size it was drawn.
+        printf '\n\033[38;5;240m%s\033[0m\n' "----------------------------------------------------------------"
+        printf '\033[1;38;5;75m%s\033[0m\n' "$title"
+        printf '\033[38;5;245m%s\033[0m\n\n' "$img"
+        # ⛔⛔ ONE ROW SHORT IS NOT ENOUGH HERE. `imgcat` fits the image inside the box it is
+        # given; a box the full height of the window leaves no room for the NEXT caption, so a
+        # chronicle would show exactly one entry per screen with its header scrolled off. Six
+        # rows of headroom keeps a caption and the top of its image together.
+        h=$((rows - 6))
+        [ "$h" -lt 4 ] && h=4
+        # Size in cells, not `--width 100%`: a percentage is resolved against pixels, and on a
+        # fractionally scaled display that overshoots the window and clips the image.
         # stderr is dropped: imgcat's own diagnostics would be drawn INTO the picture.
         wezterm imgcat --width "$cols" --height "$h" "$img" 2>/dev/null
-    fi
-    sleep 0.4
+        printf '\n'
+    done
+    sleep 0.3
 done
 """
 
 _proc: subprocess.Popen | None = None  # the current image window, if still open
 
-#: Which image the open window should be showing. ⭐ The window watches this file, so a second
-#: `show_image` is a REDRAW in the window that is already there rather than a new window — which
-#: is what keeps a tiling layout intact. One path, overwritten; nothing accumulates.
+#: The chronicle. Line 1 is an epoch stamp; every line after it is ``<path>\t<caption>``.
+#: ⭐ Append-only by design — the viewer draws whatever lines it has not drawn yet, so the
+#: handoff is one `write`, and a window that is not open yet simply draws the backlog when
+#: it starts.
 IMG_STATE = os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "wezterm-image-mcp.current"
+    os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "wezterm-image-mcp.log"
 )
 
 
@@ -101,24 +125,46 @@ def _window_is_open() -> bool:
     """True when a viewer we started is still running.
 
     ⚠️ Asks the PROCESS, not a remembered flag. The user closes this window by hand — that is the
-    normal way it ends — so a cached "it is open" would leave every later image written to a state
-    file nobody reads, and the tool would report success while showing nothing.
+    normal way it ends — so a cached "it is open" would leave every later image appended to a log
+    nobody reads, and the tool would report success while showing nothing.
     """
     return _proc is not None and _proc.poll() is None
 
 
-@mcp.tool()
-async def show_image(file_path: str, cols: int | None = None, rows: int | None = None) -> str:
-    """Show an image to the user in its own WezTerm window (PNG/JPEG/GIF/WebP/...).
+def _reset_log() -> None:
+    """Start a fresh chronicle. The epoch is what tells the viewer to wipe its scrollback."""
+    os.makedirs(os.path.dirname(IMG_STATE), exist_ok=True)
+    tmp = f"{IMG_STATE}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(f"epoch {time.time_ns()}\n")
+    os.replace(tmp, IMG_STATE)
 
-    Use whenever the user asks to see an image, or to show them a file you're
-    working with. The window is a standalone process the user can close on its own.
-    Opening a new image closes the previous one.
+
+@mcp.tool()
+async def show_image(
+    file_path: str,
+    title: str | None = None,
+    cols: int | None = None,
+    rows: int | None = None,
+    clear: bool = False,
+) -> str:
+    """Append an image to the user's WezTerm image window (PNG/JPEG/GIF/WebP/...).
+
+    The window is a scrollable CHRONICLE: each image is added below the previous one with its
+    caption and path above it, and nothing is replaced. Scroll up in that window to see
+    everything shown earlier. The window is a standalone process the user can close on its own.
+
+    ⭐ ALWAYS pass `title` — it is printed above the image as selectable terminal text and is
+    the only thing that says what the picture is and where it came from. An untitled image in a
+    long chronicle is unidentifiable.
 
     Args:
         file_path: Path to the image file.
-        cols: Optional window width in columns. A window manager may override it.
+        title: Short caption printed above the image. Say what it shows, not just its filename.
+        cols: Optional window width in columns, used only when the window is first created.
         rows: Optional window height in rows. Same.
+        clear: Start a fresh chronicle, wiping the window's scrollback, before appending this
+            image. Use when beginning an unrelated batch — not between images of one batch.
     """
     if not WEZTERM:
         return "Error: wezterm not found on PATH"
@@ -126,20 +172,19 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
     if not os.path.exists(path):
         return f"Error: file not found: {path}"
 
-    # ⭐⭐ POINT THE EXISTING WINDOW AT THE NEW IMAGE. Writing the path is the whole handoff: the
-    # viewer re-reads this file every tick and redraws when it changes. Closing and reopening
-    # instead makes a tiling window manager re-lay the entire workspace, which is disruptive
-    # precisely when the window is most useful — beside the work, in a split.
-    # ⚠️ Written atomically. A reader that catches a half-written path would fail its `-f` test
-    # and, worse, could stick on the old image with no sign anything went wrong.
-    os.makedirs(os.path.dirname(IMG_STATE), exist_ok=True)
-    tmp = f"{IMG_STATE}.{os.getpid()}"
-    with open(tmp, "w") as fh:
-        fh.write(path)
-    os.replace(tmp, IMG_STATE)
+    caption = (title or os.path.basename(path)).replace("\t", " ").replace("\n", " ")
+
+    if clear or not os.path.exists(IMG_STATE):
+        _reset_log()
+
+    # ⚠️ One `write` of one complete line, opened in append mode. A reader that catches a
+    # half-written line would show a broken path — and worse, `wc -l` would already have
+    # counted it, so the entry would be skipped and never retried.
+    with open(IMG_STATE, "a") as fh:
+        fh.write(f"{path}\t{caption}\n")
 
     if _window_is_open():
-        return f"Showing {os.path.basename(path)} in the existing wezterm window"
+        return f"Appended {os.path.basename(path)} to the wezterm image window"
 
     # The window runs the user's own wezterm.lua, so it looks like their terminal. It
     # carries WEZTERM_IMAGE_MCP=1 in its environment, which a config can test to skip
@@ -156,6 +201,7 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
             [
                 WEZTERM,
                 "--config", "hide_tab_bar_if_only_one_tab=true",
+                "--config", "scrollback_lines=20000",
                 *(["--config", f"initial_cols={int(cols)}"] if cols else []),
                 *(["--config", f"initial_rows={int(rows)}"] if rows else []),
                 "start", "--always-new-process",
@@ -171,7 +217,7 @@ async def show_image(file_path: str, cols: int | None = None, rows: int | None =
     except OSError as exc:
         return f"Error: could not start a wezterm window: {exc}"
 
-    return f"Showing {os.path.basename(path)} in a new wezterm window"
+    return f"Showing {os.path.basename(path)} in a new wezterm image window"
 
 
 if __name__ == "__main__":
